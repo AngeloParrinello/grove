@@ -1,0 +1,439 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+
+readonly SCRIPT_NAME="grove"
+readonly VERSION="1.0.0"
+
+GROVE_HOME="${GROVE_HOME:-$HOME/.grove}"
+WT_ROOT="$GROVE_HOME/worktrees"
+
+# tmux session that hosts every window, one window per repo+worktree.
+DEFAULT_SESSION="${GROVE_SESSION:-grove}"
+
+# Known coding agents in discovery order (single source of truth)
+readonly _KNOWN_AGENTS=(claude codex opencode amp aider goose gemini)
+
+# ─── Colors ───────────────────────────────────────────────────────────────────
+
+if [[ -t 1 ]]; then
+  BOLD=$'\033[1m'
+  DIM=$'\033[2m'
+  RED=$'\033[0;31m'
+  GREEN=$'\033[0;32m'
+  YELLOW=$'\033[0;33m'
+  CYAN=$'\033[0;36m'
+  RESET=$'\033[0m'
+else
+  BOLD='' DIM='' RED='' GREEN='' YELLOW='' CYAN='' RESET=''
+fi
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+die()  { echo -e "${RED}error:${RESET} $*" >&2; exit 1; }
+warn() { echo -e "${YELLOW}warn:${RESET} $*" >&2; }
+info() { echo -e "${GREEN}✓${RESET} $*"; }
+dim()  { echo -e "${DIM}$*${RESET}"; }
+
+check_tmux() { command -v tmux &>/dev/null || die "tmux is not installed."; }
+
+# Every subcommand needs both, and in this order: a missing git would otherwise
+# be reported as "not inside a git repository".
+check_repo() {
+  command -v git &>/dev/null || die "git is not installed."
+  git rev-parse --git-common-dir &>/dev/null ||
+    die "Not inside a git repository.\n  cd into a clone and retry."
+}
+
+# ─── Repo identity ────────────────────────────────────────────────────────────
+
+# Absolute path of the repo's shared git dir. Works from the primary clone and
+# from any linked worktree (git resolves --git-common-dir to the primary).
+_git_common_dir() { git rev-parse --path-format=absolute --git-common-dir 2>/dev/null; }
+
+# Name used to group this repo's worktrees under $WT_ROOT and to prefix its
+# tmux windows. Derived purely from git, nothing is stored in the repo.
+# /path/to/foo/.git → foo (normal clone); /path/to/foo.git → foo (bare repo).
+_repo_name() {
+  local gd; gd="$(_git_common_dir)"
+  [[ "$(basename "$gd")" == .git ]] && gd="$(dirname "$gd")"
+  basename "${gd%.git}"
+}
+
+# Branch name is the directory name. Only '/' has to go since it would nest directories.
+_slug() { printf '%s\n' "${1//\//-}"; }
+
+# Emit "<path>\t<branch>" for every worktree of this repo.
+# Branch is empty for detached HEADs; the bare entry is skipped.
+# This is the only porcelain parser in the script. substr, not $2: worktree
+# paths may contain spaces.
+_worktrees() {
+  git worktree list --porcelain 2>/dev/null | awk '
+    /^worktree /{p=substr($0,10); b=""}
+    /^branch /  {b=substr($0,8); sub(/^refs\/heads\//,"",b)}
+    /^bare$/    {p=""}
+    /^$/        {if(p!="")print p"\t"b; p=""; b=""}
+    END         {if(p!="")print p"\t"b}' || true
+}
+
+# Print the path of the worktree that has $1 checked out, or return 1.
+# A branch can live in exactly one worktree — including the primary clone's
+# own HEAD, which is why this lookup comes before any `worktree add`.
+_wt_of_branch() { _worktrees | awk -F'\t' -v w="$1" '$2==w&&!f{print $1;f=1} END{exit !f}'; }
+
+# Default base branch for new worktrees: origin/HEAD, else the repo's own HEAD.
+# pipefail makes the first pipeline fail when origin/HEAD is absent.
+_default_branch() {
+  git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' && return 0
+  git --git-dir="$(_git_common_dir)" symbolic-ref --short HEAD 2>/dev/null
+}
+
+_git_is_dirty() { git -C "$1" status --porcelain 2>/dev/null | grep -q .; }
+
+# ─── Tool resolution ──────────────────────────────────────────────────────────
+
+# Print the first candidate whose binary (word 1, so "code -w" works) is in
+# PATH, or return 1.
+_first_cmd() {
+  local c
+  for c in "$@"; do
+    command -v "${c%% *}" &>/dev/null && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
+# Resolve the IDE for pane 2. Prints empty and warns if none is found — the
+# agent pane is still worth having on its own, so this must not be fatal.
+_resolve_ide() {
+  _first_cmd ${GROVE_EDITOR:+"$GROVE_EDITOR"} idea && return 0
+  warn "No editor found (tried: ${GROVE_EDITOR:+$GROVE_EDITOR }idea). Opening a plain shell instead."
+  warn "Set \$GROVE_EDITOR to pick one."
+  printf '\n'
+}
+
+# Resolve the coding agent for pane 1: $CODING_AGENT → auto-discover → none.
+_resolve_ai() {
+  if [[ -n "${CODING_AGENT:-}" ]]; then
+    _first_cmd "$CODING_AGENT" ||
+      die "\$CODING_AGENT is set to '${CODING_AGENT}' but '${CODING_AGENT%% *}' was not found in PATH."
+    return 0
+  fi
+  _first_cmd "${_KNOWN_AGENTS[@]}" && return 0
+  warn "No coding agent found in PATH (${_KNOWN_AGENTS[*]})."
+  warn "Set \$CODING_AGENT to specify one, or install a coding agent."
+  printf '\n'
+}
+
+# ─── Worktree resolution ──────────────────────────────────────────────────────
+
+# Resolve (creating if needed) the worktree for a branch.
+# Sets globals: WT_PATH, WT_WINDOW
+#
+# The rule: if the branch is already checked out anywhere, use that path.
+# Otherwise add a worktree under the central root. That single rule makes
+# `grove main` open the primary clone and re-runs idempotent.
+resolve_worktree() {
+  local branch="$1"
+  local repo; repo="$(_repo_name)"
+
+  git check-ref-format --branch "$branch" &>/dev/null ||
+    die "Invalid branch name: '$branch'."
+
+  WT_WINDOW="$repo/$branch"
+
+  # Drop metadata for worktrees whose directories were deleted by hand. Must
+  # happen before the lookup below, or a stale entry resolves to a dead path.
+  git worktree prune 2>/dev/null || true
+
+  local existing
+  if existing="$(_wt_of_branch "$branch")"; then
+    WT_PATH="$existing"
+    return 0
+  fi
+
+  WT_PATH="$WT_ROOT/$repo/$(_slug "$branch")"
+
+  if [[ -e "$WT_PATH" ]]; then
+    die "'$WT_PATH' already exists but is not a worktree of this repo.\n  Remove it and retry: ${CYAN}rm -rf '$WT_PATH'${RESET}"
+  fi
+
+  echo -e "Creating worktree ${BOLD}${branch}${RESET} at ${CYAN}${WT_PATH}${RESET}..."
+
+  # git creates missing parent directories for the target path.
+  if git show-ref --verify --quiet "refs/heads/$branch"; then
+    git worktree add "$WT_PATH" "$branch" --quiet ||
+      die "Failed to create worktree for existing branch '$branch'."
+  elif git rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null; then
+    git worktree add --track -b "$branch" "$WT_PATH" "origin/$branch" --quiet ||
+      die "Failed to create worktree tracking 'origin/$branch'."
+  else
+    local base; base="$(_default_branch)" ||
+      die "Could not determine a base branch to fork '$branch' from."
+    git worktree add -b "$branch" "$WT_PATH" "$base" --quiet ||
+      die "Failed to create worktree for new branch '$branch' from '$base'."
+  fi
+
+  info "Created ${BOLD}${branch}${RESET} → ${CYAN}${WT_PATH}${RESET}"
+}
+
+# ─── tmux ─────────────────────────────────────────────────────────────────────
+
+# Print the id of the window named $1, searching every session. Returns 1 if
+# there is none.
+#
+# Windows are targeted by id (@N), never by "session:name" — tmux refuses
+# ambiguous name targets, and ids sidestep any parsing of '.' or ':' in names.
+_find_window() {
+  tmux list-windows -a -F '#{window_id}'$'\t''#{window_name}' 2>/dev/null |
+    awk -F'\t' -v w="$1" '$2==w&&!f{print $1;f=1} END{exit !f}'
+}
+
+# Print "active", "open", or "-" for the window named $1.
+_win_state() {
+  tmux list-windows -a -F '#{window_name}'$'\t''#{window_active}' 2>/dev/null |
+    awk -F'\t' -v w="$1" '$1==w&&!f{print ($2==1?"active":"open"); f=1}
+                          END{if(!f)print "-"}' || true
+}
+
+# Lay out the two panes of window $1 (a window id), both cd'd into $WT_PATH.
+_setup_panes() {
+  local win="$1"
+  local ide ai
+  ide="$(_resolve_ide)"
+  ai="$(_resolve_ai)"
+
+  local quoted_dir
+  printf -v quoted_dir '%q' "$WT_PATH"
+
+  local p1 p2
+  p1="$(tmux list-panes -t "$win" -F '#{pane_id}' | head -1)"
+  tmux send-keys   -t "$p1" "cd $quoted_dir${ai:+ && $ai}" Enter
+  tmux select-pane -t "$p1" -T "${ai%% *}"
+
+  p2="$(tmux split-window -t "$win" -h -c "$WT_PATH" -P -F '#{pane_id}')"
+  tmux send-keys   -t "$p2" "cd $quoted_dir${ide:+ && $ide .}" Enter
+  tmux select-pane -t "$p2" -T "${ide%% *}"
+
+  tmux select-pane -t "$p1"
+}
+
+# Create or focus the window for $WT_PATH / $WT_WINDOW, then attach.
+launch_window() {
+  local win target=""
+
+  if win="$(_find_window "$WT_WINDOW")"; then
+    info "Switching to ${BOLD}${WT_WINDOW}${RESET}"
+  else
+    # Inside tmux, add the window to the session we are already in, so no
+    # switch-client is needed and the user's other windows stay put.
+    if [[ -n "${TMUX:-}" ]]; then
+      target="$(tmux display-message -p '#{session_id}')"
+    elif tmux has-session -t "$DEFAULT_SESSION" 2>/dev/null; then
+      target="$DEFAULT_SESSION:"
+    fi
+
+    if [[ -n "$target" ]]; then
+      win="$(tmux new-window -t "$target" -n "$WT_WINDOW" -c "$WT_PATH" -P -F '#{window_id}')"
+    else
+      # -x/-y size the detached session so the split below is not 40 columns
+      # per pane until a client attaches.
+      win="$(tmux new-session -d -s "$DEFAULT_SESSION" -n "$WT_WINDOW" \
+               -c "$WT_PATH" -x 220 -y 50 -P -F '#{window_id}')"
+    fi
+    _setup_panes "$win"
+    info "Opened ${BOLD}${WT_WINDOW}${RESET}"
+  fi
+
+  tmux select-window -t "$win"
+
+  [[ -n "${GROVE_TEST_NO_ATTACH:-}" ]] && return 0
+  local sid; sid="$(tmux display-message -p -t "$win" '#{session_id}')"
+  if [[ -z "${TMUX:-}" ]]; then
+    tmux attach -t "$sid"
+  elif [[ "$(tmux display-message -p '#{session_id}')" != "$sid" ]]; then
+    tmux switch-client -t "$sid"
+  fi
+}
+
+# ─── Subcommands ──────────────────────────────────────────────────────────────
+
+cmd_open() {
+  local branch="$1"
+  check_tmux
+  check_repo
+  resolve_worktree "$branch"
+  launch_window
+}
+
+cmd_list() {
+  check_repo
+  local repo p b; repo="$(_repo_name)"
+
+  echo ""
+  echo -e "  ${BOLD}${repo}${RESET}"
+  echo ""
+  { printf 'BRANCH\tSTATUS\tWINDOW\tPATH\n'
+    while IFS=$'\t' read -r p b; do
+      [[ -z "$b" ]] && b="(detached $(git -C "$p" rev-parse --short HEAD 2>/dev/null))"
+      printf '%s\t%s\t%s\t%s\n' "$b" \
+        "$(_git_is_dirty "$p" && echo dirty || echo clean)" "$(_win_state "$repo/$b")" "$p"
+    done < <(_worktrees)
+  } | column -t -s $'\t' | sed -e "s|$HOME/|~/|" -e 's/^/  /'
+  echo ""
+}
+
+cmd_rm() {
+  local force=false branch=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --force | -f) force=true ;;
+    -*) die "Unknown option: $1." ;;
+    *)
+      [[ -n "$branch" ]] && die "Too many arguments."
+      branch="$1"
+      ;;
+    esac
+    shift
+  done
+  [[ -z "$branch" ]] && die "Usage: $SCRIPT_NAME rm <branch> [--force]"
+
+  check_repo
+  local repo path
+  repo="$(_repo_name)"
+  path="$(_wt_of_branch "$branch")" ||
+    die "No worktree has branch '$branch' checked out.\n  Run ${CYAN}$SCRIPT_NAME list${RESET} to see them."
+
+  # The primary clone is the user's repo, not a grove-managed worktree.
+  local primary; primary="$(dirname "$(_git_common_dir)")"
+  if [[ "$path" == "$primary" ]]; then
+    die "'$branch' is checked out in your main clone ($path).\n  grove will not remove it — switch branches there with git instead."
+  fi
+
+  if ! $force && _git_is_dirty "$path"; then
+    die "Worktree '$branch' has uncommitted changes.\n  Commit or stash them, or use ${CYAN}--force${RESET}."
+  fi
+
+  local window="$repo/$branch" win
+  if win="$(_find_window "$window")"; then
+    if ! $force; then
+      die "tmux window '${window}' is still open.\n  Close it first, or use ${CYAN}--force${RESET} to remove everything."
+    fi
+    echo -e "  Killing tmux window ${BOLD}${window}${RESET}..."
+    tmux kill-window -t "$win" 2>/dev/null || true
+  fi
+
+  echo -e "  Removing worktree ${BOLD}${branch}${RESET}..."
+  if $force; then
+    git worktree remove --force "$path" 2>/dev/null || rm -rf "$path"
+  else
+    git worktree remove "$path" ||
+      die "git refused to remove the worktree. Use ${CYAN}--force${RESET} to override."
+  fi
+  git worktree prune 2>/dev/null || true
+
+  if git branch -d "$branch" &>/dev/null; then
+    dim "  Deleted branch $branch"
+  elif $force && git branch -D "$branch" &>/dev/null; then
+    dim "  Force-deleted branch $branch"
+  else
+    warn "Branch '$branch' kept (unmerged). Delete with: git branch -D $branch"
+  fi
+
+  # Tidy the per-repo directory once its last worktree is gone.
+  rmdir "$WT_ROOT/$repo" 2>/dev/null || true
+
+  info "Removed ${BOLD}${branch}${RESET}"
+}
+
+cmd_path() {
+  local branch="${1:-}"
+  [[ -z "$branch" ]] && die "Usage: $SCRIPT_NAME path <branch>"
+  check_repo
+  _wt_of_branch "$branch" ||
+    printf '%s\n' "$WT_ROOT/$(_repo_name)/$(_slug "$branch")"
+}
+
+# ─── Usage ────────────────────────────────────────────────────────────────────
+
+usage_main() {
+  cat <<EOF
+
+${BOLD} ██████╗ ██████╗  ██████╗ ██╗   ██╗███████╗${RESET}
+${BOLD}██╔════╝ ██╔══██╗██╔═══██╗██║   ██║██╔════╝${RESET}
+${BOLD}██║  ███╗██████╔╝██║   ██║██║   ██║█████╗${RESET}
+${BOLD}██║   ██║██╔══██╗██║   ██║╚██╗ ██╔╝██╔══╝${RESET}
+${BOLD}╚██████╔╝██║  ██║╚██████╔╝ ╚████╔╝ ███████╗${RESET}
+${BOLD} ╚═════╝ ╚═╝  ╚═╝ ╚═════╝   ╚═══╝  ╚══════╝${RESET}
+
+${BOLD}${SCRIPT_NAME}${RESET} — centralized git worktrees with tmux
+
+${BOLD}Usage:${RESET}
+  $SCRIPT_NAME                          List this repo's worktrees
+  $SCRIPT_NAME <branch>                 Create (if needed) and open a worktree
+  $SCRIPT_NAME list                     List this repo's worktrees
+  $SCRIPT_NAME rm <branch> [--force]    Remove worktree, branch, and window
+  $SCRIPT_NAME path <branch>            Print a worktree's path
+  $SCRIPT_NAME --version                Print version
+  $SCRIPT_NAME --test                   Run self-tests
+
+${BOLD}How it works:${RESET}
+  Run it from anywhere inside an ordinary git clone. Nothing is added to the
+  repo — no config file, no restructuring. Worktrees are created here:
+
+    ${CYAN}${WT_ROOT}/<repo>/<branch>${RESET}
+
+  A branch already checked out somewhere (including your main clone) is
+  reused rather than duplicated, so ${CYAN}$SCRIPT_NAME main${RESET} opens your clone.
+
+${BOLD}Tmux layout:${RESET}
+  One session (${CYAN}${DEFAULT_SESSION}${RESET}, or your current one) holding every window.
+  One window per worktree, named ${CYAN}<repo>/<branch>${RESET}.
+  Each window: coding agent (left) + editor (right).
+
+${BOLD}Environment:${RESET}
+  GROVE_HOME      Worktree root (default: \$HOME/.grove)
+  GROVE_SESSION   tmux session name (default: grove)
+  GROVE_EDITOR    Editor command (default: idea)
+  CODING_AGENT    Agent command (default: first of ${_KNOWN_AGENTS[*]})
+
+${BOLD}Examples:${RESET}
+  cd ~/projects/zio-blocks
+  $SCRIPT_NAME                     ${DIM}# list worktrees${RESET}
+  $SCRIPT_NAME feature-auth        ${DIM}# create worktree + branch + window${RESET}
+  $SCRIPT_NAME feature-auth        ${DIM}# re-run switches to the window${RESET}
+  $SCRIPT_NAME fix/schema          ${DIM}# → \$GROVE_HOME/worktrees/zio-blocks/fix-schema${RESET}
+  $SCRIPT_NAME main                ${DIM}# opens ~/projects/zio-blocks itself${RESET}
+  $SCRIPT_NAME rm feature-auth     ${DIM}# removes worktree, branch, and window${RESET}
+  cd "\$($SCRIPT_NAME path fix/schema)"
+
+EOF
+}
+
+# ─── Main dispatch ────────────────────────────────────────────────────────────
+
+main() {
+  case "${1:-}" in
+  "") cmd_list ;;
+  -h | --help) usage_main; exit 0 ;;
+  --version) echo "$SCRIPT_NAME $VERSION"; exit 0 ;;
+  --test) cmd_test; exit $? ;;
+  list | ls) shift; [[ $# -gt 0 ]] && die "Usage: $SCRIPT_NAME list"; cmd_list ;;
+  rm) shift; cmd_rm "$@" ;;
+  path) shift; cmd_path "$@" ;;
+  -*) die "Unknown option: $1\n  Run ${CYAN}$SCRIPT_NAME --help${RESET} for usage." ;;
+  *) [[ $# -gt 1 ]] && die "Too many arguments."; cmd_open "$1" ;;
+  esac
+}
+
+# Source the test suite from a sibling file so it stays maintainable
+# without bloating the main script.
+_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ -f "$_SCRIPT_DIR/grove_test" ]]; then
+  # shellcheck source=grove_test
+  source "$_SCRIPT_DIR/grove_test"
+else
+  cmd_test() { die "grove_test not found next to this script."; }
+fi
+
+main "$@"

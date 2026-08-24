@@ -1,0 +1,422 @@
+# ─── Self-test ───────────────────────────────────────────────────────────────
+
+cmd_test() {
+  local tmp
+  # pwd -P so comparisons match `git worktree list`, which reports physical
+  # paths (/private/var/... on macOS, where mktemp hands back the /var symlink).
+  tmp="$(cd "$(mktemp -d)" && pwd -P)"
+  local passed=0 failed=0 skipped=0
+
+  # Commits made by the fixtures must not depend on a global git identity.
+  export GIT_AUTHOR_NAME=grove-test GIT_AUTHOR_EMAIL=test@localhost
+  export GIT_COMMITTER_NAME=grove-test GIT_COMMITTER_EMAIL=test@localhost
+
+  # Absolute path to this script. $0 may be relative ("./grove"), and the
+  # helpers below cd into fixture repos before re-invoking it.
+  local self="$_SCRIPT_DIR/$(basename "$0")"
+
+  # Every child grove writes worktrees here, never into $HOME.
+  local ghome="$tmp/ghome"
+  local gsess="grove-test-$$"
+
+  # Drop the temp dir and the test session however the run ends.
+  # Double-quotes expand $tmp/$gsess now (definition time), so both must already
+  # be set. The inner single-quotes protect the expanded values from splitting.
+  # shellcheck disable=SC2064
+  trap "rm -rf -- '$tmp'; tmux kill-session -t '$gsess' 2>/dev/null || true" EXIT
+
+  # ── Helpers ──────────────────────────────────────────────────────────────
+
+  _t_pass() { echo -e "  ${GREEN}✓${RESET} $*"; ((passed++)) || true; }
+  _t_fail() { echo -e "  ${RED}✗${RESET} $*"; ((failed++)) || true; }
+  _t_skip() { echo -e "  ${DIM}○${RESET} ${DIM}$* (skipped)${RESET}"; ((skipped++)) || true; }
+
+  # _t_check <desc> <cmd> [args...] — pass if command exits 0
+  _t_check() {
+    local desc="$1"; shift
+    if "$@" &>/dev/null; then _t_pass "$desc"; else _t_fail "$desc"; fi
+  }
+
+  # _t_grep <desc> <pattern> <cmd> [args...] — pass if output matches pattern
+  _t_grep() {
+    local desc="$1" pattern="$2"; shift 2
+    local out
+    out="$("$@" 2>&1)" || true
+    if echo "$out" | grep -q "$pattern"; then _t_pass "$desc"; else _t_fail "$desc"; fi
+  }
+
+  # _t_eq <desc> <expected> <actual>
+  _t_eq() {
+    if [[ "$2" == "$3" ]]; then _t_pass "$1"; else _t_fail "$1 (want '$2', got '$3')"; fi
+  }
+
+  _section() { echo ""; echo -e "${BOLD}$*${RESET}"; }
+
+  # Create a repo at $tmp/$1 with one commit on 'main'. Prints its path.
+  # symbolic-ref instead of `init -b` so this works on git < 2.28.
+  _mkrepo() {
+    local d="$tmp/$1"
+    rm -rf "$d"; mkdir -p "$d"
+    git -C "$d" init -q
+    git -C "$d" symbolic-ref HEAD refs/heads/main
+    git -C "$d" commit -q --allow-empty -m init
+    printf '%s\n' "$d"
+  }
+
+  # Run grove inside a repo, isolated from the user's $HOME and tmux session.
+  # The agent/editor are stubbed with harmless real binaries so pane setup does
+  # not launch an actual IDE or coding agent during the test run.
+  # env -u TMUX matters: the test runner may itself be inside tmux, and grove
+  # deliberately adds windows to the current session when $TMUX is set. Without
+  # this the tests would spray windows into the user's live session.
+  _g() {
+    local d="$1"; shift
+    ( cd "$d" && env -u TMUX GROVE_HOME="$ghome" GROVE_SESSION="$gsess" \
+        GROVE_TEST_NO_ATTACH=1 CODING_AGENT=cat GROVE_EDITOR=true \
+        "$BASH" "$self" "$@" 2>&1 )
+  }
+  _grc() {
+    local d="$1"; shift
+    local rc=0
+    ( cd "$d" && env -u TMUX GROVE_HOME="$ghome" GROVE_SESSION="$gsess" \
+        GROVE_TEST_NO_ATTACH=1 CODING_AGENT=cat GROVE_EDITOR=true \
+        "$BASH" "$self" "$@" &>/dev/null ) || rc=$?
+    echo $rc
+  }
+
+  local has_tmux=false
+  command -v tmux &>/dev/null && has_tmux=true
+  # A session left over from an aborted run would be found by _find_window,
+  # which searches every session by design.
+  $has_tmux && { tmux kill-session -t "$gsess" 2>/dev/null || true; }
+
+  # ── Section: ID — repo identity and slugs ────────────────────────────────
+
+  _section "ID1 — --version and --help"
+
+  _t_grep "ID1: --version prints name and version" "^grove $VERSION\$" _g "$tmp" --version
+  _t_grep "ID1: --help documents the central worktree root" "worktrees/<repo>/<branch>" \
+    _g "$tmp" --help
+
+  _section "ID2 — _repo_name derives identity from git alone"
+
+  local r1; r1="$(_mkrepo alpha)"
+  _t_eq "ID2: name from primary clone" "alpha" "$( cd "$r1" && _repo_name )"
+
+  # From a linked worktree, --git-common-dir must resolve back to the primary.
+  git -C "$r1" worktree add -q "$tmp/detached-wt" -b probe
+  _t_eq "ID2: name from inside a linked worktree" "alpha" \
+    "$( cd "$tmp/detached-wt" && _repo_name )"
+
+  # A bare repo has no .git component; the name comes from <name>.git.
+  git init -q --bare "$tmp/beta.git"
+  _t_eq "ID2: name from a bare repo" "beta" "$( cd "$tmp/beta.git" && _repo_name )"
+
+  _section "ID3 — _slug maps branch names to directory names"
+
+  _t_eq "ID3: plain name unchanged"        "feature-auth" "$(_slug feature-auth)"
+  _t_eq "ID3: single slash becomes hyphen" "fix-schema"   "$(_slug fix/schema)"
+  _t_eq "ID3: every slash becomes hyphen"  "a-b-c"        "$(_slug a/b/c)"
+  _t_eq "ID3: dots are preserved"          "release-1.2"  "$(_slug release/1.2)"
+
+  _section "ID4 — _worktrees and _wt_of_branch"
+
+  _t_eq "ID4: primary clone is listed with its branch" "$r1"$'\t'"main" \
+    "$( cd "$r1" && _worktrees | head -1 )"
+  _t_eq "ID4: two worktrees listed" "2" "$( cd "$r1" && _worktrees | wc -l | tr -d ' ' )"
+  _t_eq "ID4: _wt_of_branch finds the primary clone" "$r1" \
+    "$( cd "$r1" && _wt_of_branch main )"
+  _t_check "ID4: _wt_of_branch fails for an unknown branch" \
+    bash -c "! ( cd '$r1' && _wt_of_branch nope )"
+
+  _section "ID5 — _default_branch"
+
+  _t_eq "ID5: falls back to the repo's own HEAD" "main" "$( cd "$r1" && _default_branch )"
+
+  git -C "$r1" worktree remove --force "$tmp/detached-wt"
+  git -C "$r1" branch -D probe &>/dev/null || true
+
+  # ── Section: WT — worktree creation ──────────────────────────────────────
+
+  if ! $has_tmux; then
+    for _t in WT1 WT2 WT3 WT4 WT5 LS1 RM1 RM2 RM3 TX1 TX2; do
+      _t_skip "$_t (tmux not in PATH)"
+    done
+  fi
+
+  if $has_tmux; then
+
+  _section "WT1 — new branch: worktree lands under the central root"
+
+  local r2; r2="$(_mkrepo gamma)"
+  _t_eq "WT1: exits 0" "0" "$(_grc "$r2" feature-auth)"
+  _t_check "WT1: worktree created at \$GROVE_HOME/worktrees/<repo>/<branch>" \
+    test -d "$ghome/worktrees/gamma/feature-auth"
+  _t_check "WT1: nothing added to the repo itself" \
+    test ! -e "$r2/feature-auth"
+  _t_grep "WT1: branch created" "feature-auth" git -C "$r2" branch
+
+  _section "WT2 — re-run is idempotent, and slashes become hyphens"
+
+  _t_eq "WT2: second run exits 0" "0" "$(_grc "$r2" feature-auth)"
+  _t_eq "WT2: still exactly one worktree for the branch" "1" \
+    "$( cd "$r2" && _worktrees | grep -c $'\tfeature-auth$' )"
+
+  _t_eq "WT2: slashed branch exits 0" "0" "$(_grc "$r2" fix/schema)"
+  _t_check "WT2: directory is slugged" test -d "$ghome/worktrees/gamma/fix-schema"
+  _t_eq "WT2: branch keeps its slash" "$ghome/worktrees/gamma/fix-schema" \
+    "$( cd "$r2" && _wt_of_branch fix/schema )"
+
+  _section "WT3 — a branch already checked out is reused, never duplicated"
+
+  _t_eq "WT3: grove main exits 0" "0" "$(_grc "$r2" main)"
+  _t_check "WT3: no central worktree created for main" \
+    test ! -e "$ghome/worktrees/gamma/main"
+  _t_eq "WT3: main still resolves to the primary clone" "$r2" \
+    "$( cd "$r2" && _wt_of_branch main )"
+
+  _section "WT4 — remote-only branch is tracked"
+
+  local up r3
+  up="$(_mkrepo upstream)"
+  git -C "$up" checkout -q -b published
+  git -C "$up" commit -q --allow-empty -m published
+  git -C "$up" checkout -q main
+  r3="$tmp/delta"
+  git clone -q "$up" "$r3"
+
+  _t_eq "WT4: exits 0" "0" "$(_grc "$r3" published)"
+  _t_check "WT4: worktree created" test -d "$ghome/worktrees/delta/published"
+  _t_eq "WT4: upstream is set to origin/published" "origin/published" \
+    "$(git -C "$ghome/worktrees/delta/published" \
+         rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)"
+
+  _section "WT5 — existing local branch is checked out, not recreated"
+
+  git -C "$r2" branch spare main
+  _t_eq "WT5: exits 0" "0" "$(_grc "$r2" spare)"
+  _t_eq "WT5: worktree points at the existing branch" "$ghome/worktrees/gamma/spare" \
+    "$( cd "$r2" && _wt_of_branch spare )"
+
+  # ── Section: LS — list ───────────────────────────────────────────────────
+
+  _section "LS1 — list reports branch, status, and path"
+
+  echo scratch > "$ghome/worktrees/gamma/feature-auth/dirty.txt"
+
+  local ls_out; ls_out="$(_g "$r2" list)"
+  _t_grep "LS1: header present"        "BRANCH"                 echo "$ls_out"
+  _t_grep "LS1: repo name shown"       "gamma"                  echo "$ls_out"
+  _t_grep "LS1: primary clone listed"  "main.*clean"            echo "$ls_out"
+  _t_grep "LS1: untracked file counts as dirty" "feature-auth.*dirty" echo "$ls_out"
+  _t_grep "LS1: slashed branch listed" "fix/schema"             echo "$ls_out"
+  _t_grep "LS1: no ANSI escapes leak into the table" \
+    "feature-auth  *dirty" echo "$ls_out"
+  _t_eq "LS1: bare 'grove' is the same as 'grove list'" "$(_g "$r2" list)" "$(_g "$r2")"
+
+  # ── Section: RM — removal ────────────────────────────────────────────────
+
+  # Close the windows WT1-WT5 opened; TX2 covers the window-open refusal.
+  tmux kill-session -t "$gsess" 2>/dev/null || true
+
+  _section "RM1 — rm refuses a dirty worktree, then removes it with --force"
+
+  _t_check "RM1: exits non-zero while dirty" \
+    test "$(_grc "$r2" rm feature-auth)" -ne 0
+  _t_check "RM1: worktree still present" test -d "$ghome/worktrees/gamma/feature-auth"
+  _t_grep "RM1: message mentions uncommitted changes" "uncommitted" \
+    _g "$r2" rm feature-auth
+
+  _t_eq "RM1: --force exits 0" "0" "$(_grc "$r2" rm feature-auth --force)"
+  _t_check "RM1: directory removed" test ! -d "$ghome/worktrees/gamma/feature-auth"
+  _t_check "RM1: branch deleted" \
+    bash -c "! git -C '$r2' branch | grep -q feature-auth"
+
+  _section "RM2 — rm removes a clean worktree, branch, and empty repo dir"
+
+  _t_eq "RM2: exits 0" "0" "$(_grc "$r2" rm fix/schema)"
+  _t_check "RM2: directory removed" test ! -d "$ghome/worktrees/gamma/fix-schema"
+  _t_check "RM2: branch deleted" \
+    bash -c "! git -C '$r2' branch | grep -q 'fix/schema'"
+
+  _t_eq "RM2: last worktree removed" "0" "$(_grc "$r2" rm spare)"
+  _t_check "RM2: empty per-repo directory cleaned up" \
+    test ! -d "$ghome/worktrees/gamma"
+
+  _section "RM3 — rm never touches the primary clone"
+
+  _t_check "RM3: exits non-zero for the clone's own branch" \
+    test "$(_grc "$r2" rm main)" -ne 0
+  _t_grep "RM3: message names the main clone" "main clone" _g "$r2" rm main
+  _t_check "RM3: clone untouched" test -d "$r2/.git"
+  _t_grep "RM3: main branch survives" "main" git -C "$r2" branch
+
+  # ── Section: TX — tmux windows ───────────────────────────────────────────
+
+  _section "TX1 — window is named <repo>/<branch> with two panes"
+
+  _t_eq "TX1: launch exits 0" "0" "$(_grc "$r2" tx-branch)"
+  sleep 0.3
+
+  local win_names
+  win_names="$(tmux list-windows -a -F '#{window_name}' 2>/dev/null)" || win_names=""
+  _t_grep "TX1: window named gamma/tx-branch" "^gamma/tx-branch\$" echo "$win_names"
+
+  local tx_id pane_count
+  tx_id="$( cd "$r2" && _find_window gamma/tx-branch )"
+  _t_check "TX1: _find_window returns a window id" \
+    bash -c "[[ '$tx_id' == @* ]]"
+
+  # pane_title is deliberately not asserted: it is whatever the pane's shell
+  # last set it to, so it tests the user's shell, not grove. pane_start_path
+  # comes from the -c we pass, which is ours.
+  local pane_paths
+  pane_paths="$(tmux list-panes -t "$tx_id" -F '#{pane_start_path}' 2>/dev/null)"
+  pane_count="$(echo "$pane_paths" | grep -c .)"
+  _t_eq "TX1: two panes" "2" "$pane_count"
+  _t_eq "TX1: both panes start in the worktree" "2" \
+    "$(echo "$pane_paths" | grep -c "/worktrees/gamma/tx-branch$")"
+
+  _section "TX2 — list marks the branch as having an open window; rm kills it"
+
+  _t_grep "TX2: list shows the window state" "tx-branch.*\(open\|active\)" _g "$r2" list
+
+  _t_check "TX2: rm refuses while the window is open" \
+    test "$(_grc "$r2" rm tx-branch)" -ne 0
+  _t_grep "TX2: message mentions the open window" "still open" _g "$r2" rm tx-branch
+
+  _t_eq "TX2: rm --force exits 0" "0" "$(_grc "$r2" rm tx-branch --force)"
+  win_names="$(tmux list-windows -a -F '#{window_name}' 2>/dev/null)" || win_names=""
+  _t_check "TX2: window gone" \
+    bash -c "! echo '$win_names' | grep -qx 'gamma/tx-branch'"
+
+  tmux kill-session -t "$gsess" 2>/dev/null || true
+
+  fi  # end: has_tmux
+
+  # ── Section: PA — path ───────────────────────────────────────────────────
+
+  _section "PA1 — path prints existing and prospective worktree paths"
+
+  local r4; r4="$(_mkrepo epsilon)"
+  _t_eq "PA1: existing branch resolves to its worktree" "$r4" "$(_g "$r4" path main)"
+  _t_eq "PA1: unknown branch prints the prospective central path" \
+    "$ghome/worktrees/epsilon/fix-thing" "$(_g "$r4" path fix/thing)"
+  _t_check "PA1: path alone does not create anything" \
+    test ! -e "$ghome/worktrees/epsilon/fix-thing"
+  _t_check "PA1: missing argument exits non-zero" \
+    test "$(_grc "$r4" path)" -ne 0
+
+  # ── Section: ER — errors ─────────────────────────────────────────────────
+
+  _section "ER1 — clean errors outside a repo and on bad input"
+
+  local outside="$tmp/not-a-repo"
+  mkdir -p "$outside"
+  _t_check "ER1: outside a git repo exits non-zero" \
+    test "$(_grc "$outside" list)" -ne 0
+  _t_grep "ER1: message says not a git repository" "[Nn]ot inside a git repository" \
+    _g "$outside" list
+
+  _t_check "ER1: invalid branch name exits non-zero" \
+    test "$(_grc "$r4" 'bad name')" -ne 0
+  _t_grep "ER1: message names the invalid branch" "Invalid branch name" \
+    _g "$r4" 'bad name'
+  _t_check "ER1: invalid branch creates nothing" \
+    test ! -e "$ghome/worktrees/epsilon"
+
+  _t_check "ER1: unknown option exits non-zero" test "$(_grc "$r4" --nope)" -ne 0
+  _t_check "ER1: too many arguments exits non-zero" test "$(_grc "$r4" a b)" -ne 0
+  _t_check "ER1: rm without a branch exits non-zero" test "$(_grc "$r4" rm)" -ne 0
+  _t_check "ER1: rm of an unknown branch exits non-zero" \
+    test "$(_grc "$r4" rm ghost)" -ne 0
+
+  _section "ER2 — occupied target path is refused, not clobbered"
+
+  mkdir -p "$ghome/worktrees/epsilon/squatter"
+  echo keep > "$ghome/worktrees/epsilon/squatter/precious.txt"
+  _t_check "ER2: exits non-zero" test "$(_grc "$r4" squatter)" -ne 0
+  _t_grep "ER2: message says it is not a worktree of this repo" "not a worktree" \
+    _g "$r4" squatter
+  _t_check "ER2: existing file left untouched" \
+    test -f "$ghome/worktrees/epsilon/squatter/precious.txt"
+
+  _section "ER3 — a hand-deleted worktree directory does not wedge the tool"
+
+  local r5; r5="$(_mkrepo zeta)"
+  git -C "$r5" worktree add -q "$ghome/worktrees/zeta/stale" -b stale
+  rm -rf "$ghome/worktrees/zeta/stale"
+  # Stale metadata still names the path; resolve_worktree prunes before adding.
+  if $has_tmux; then
+    _t_eq "ER3: re-creating the branch's worktree exits 0" "0" "$(_grc "$r5" stale)"
+    _t_check "ER3: directory recreated" test -d "$ghome/worktrees/zeta/stale"
+    tmux kill-session -t "$gsess" 2>/dev/null || true
+  else
+    _t_skip "ER3 (tmux not in PATH)"
+    _t_skip "ER3 (tmux not in PATH)"
+  fi
+
+  # ── Section: AG — agent and editor resolution ────────────────────────────
+
+  _section "AG1 — \$CODING_AGENT"
+
+  _t_eq "AG1: explicit agent wins" "cat" "$(CODING_AGENT=cat _resolve_ai)"
+  _t_eq "AG1: flags are preserved" "cat -v" "$(CODING_AGENT='cat -v' _resolve_ai)"
+  _t_check "AG1: nonexistent agent is fatal" \
+    bash -c "! ( CODING_AGENT=grove-no-such-agent _resolve_ai )"
+
+  local ag_out
+  ag_out="$( CODING_AGENT="" PATH=/usr/bin:/bin _resolve_ai 2>&1 )" || true
+  _t_grep "AG1: warns when no agent is installed" "No coding agent" echo "$ag_out"
+  _t_eq "AG1: returns empty rather than dying" "" \
+    "$( CODING_AGENT="" PATH=/usr/bin:/bin _resolve_ai 2>/dev/null )"
+
+  _section "AG2 — \$GROVE_EDITOR, and a missing editor is not fatal"
+
+  _t_eq "AG2: explicit editor wins" "true" "$(GROVE_EDITOR=true _resolve_ide 2>/dev/null)"
+
+  local ide_out
+  ide_out="$( GROVE_EDITOR="" PATH=/usr/bin:/bin _resolve_ide 2>&1 )" || true
+  _t_grep "AG2: warns when no editor is found" "No editor found" echo "$ide_out"
+  _t_eq "AG2: returns empty instead of dying" "" \
+    "$( GROVE_EDITOR="" PATH=/usr/bin:/bin _resolve_ide 2>/dev/null )"
+
+  # ── Section: MT — meta ───────────────────────────────────────────────────
+
+  _section "MT1 — no unreferenced function definitions"
+
+  local mt_dead="" mt_fn mt_count
+  while IFS= read -r mt_fn; do
+    # The definition line counts as one occurrence; anything more is a call.
+    mt_count="$(grep -c "\b${mt_fn}\b" "$self" 2>/dev/null)" || mt_count=0
+    [[ "$mt_count" -le 1 ]] && mt_dead="${mt_dead} ${mt_fn}"
+  done < <(grep -oE '^[_a-zA-Z][_a-zA-Z0-9]*\(\)' "$self" 2>/dev/null | sed 's/()//' | sort -u)
+
+  if [[ -z "$mt_dead" ]]; then
+    _t_pass "MT1: no unreferenced function definitions"
+  else
+    _t_fail "MT1: potentially dead functions:${mt_dead}"
+  fi
+
+  _section "MT2 — the script is a single file with no repo-local config"
+
+  _t_check "MT2: grove parses under bash -n" bash -n "$self"
+  _t_check "MT2: no reference to the retired .bare layout" \
+    bash -c "! grep -q 'BARE_DIR\|gitdir:' '$self'"
+  _t_check "MT2: no init/clone/convert subcommands remain" \
+    bash -c "! grep -qE '^\\s*(init|clone)\\)' '$self'"
+
+  # ── Summary ──────────────────────────────────────────────────────────────
+
+  echo ""
+  echo -e "${BOLD}────────────────────────────────────${RESET}"
+  local total=$(( passed + failed ))
+  if [[ $failed -eq 0 ]]; then
+    echo -e "${GREEN}${BOLD}All ${total} tests passed${RESET}${DIM} (${skipped} skipped)${RESET}"
+  else
+    echo -e "${RED}${BOLD}${failed} of ${total} tests failed${RESET}${DIM} (${skipped} skipped)${RESET}"
+  fi
+  echo ""
+
+  [[ $failed -eq 0 ]]
+}
