@@ -10,8 +10,7 @@
 **Centralized git worktrees with tmux.**
 
 Every branch gets its own directory under `~/.grove/worktrees/<repo>/<branch>` and
-its own tmux window with a coding agent and an editor already open there. Your
-repositories are never modified — no config file, no `.bare` layout.
+its own tmux window with a coding agent and an editor already open there.
 
 Requires bash 3.2+, git 2.9+, tmux 3.0+.
 
