@@ -17,7 +17,7 @@ Requires bash 3.2+, git 2.9+, tmux 3.0+.
 ## Install
 
 ```bash
-curl -o ~/.local/bin/grove https://raw.githubusercontent.com/AngeloParrinello/grove/main/grove
+curl -o ~/.local/bin/grove https://raw.githubusercontent.com/AngeloParrinello/grove/v1.0.0/grove
 chmod +x ~/.local/bin/grove
 ```
 
