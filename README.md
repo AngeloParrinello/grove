@@ -33,13 +33,14 @@ cd "$(grove path fix/schema)"
 ```
 
 If a branch is already checked out in some worktree, grove opens that one;
-otherwise it creates one, forking from `origin/HEAD` (re-running is idempotent).
+otherwise it creates one, forking from `origin/HEAD`, or from `--from <ref>` (re-running is idempotent).
 
 ## Commands
 
 ```
 grove                          List this repo's worktrees
 grove <branch>                 Create (if needed) and open a worktree
+grove <branch> --from <ref>    Same, forking the new branch from <ref>
 grove list                     Same as bare grove
 grove rm <branch> [--force]    Remove worktree, branch, and window
 grove path <branch>            Print a worktree's path

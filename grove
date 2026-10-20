@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="grove"
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 
 GROVE_HOME="${GROVE_HOME:-$HOME/.grove}"
 WT_ROOT="$GROVE_HOME/worktrees"
@@ -134,7 +134,7 @@ _resolve_ai() {
 # Otherwise add a worktree under the central root. That single rule makes
 # `grove main` open the primary clone and re-runs idempotent.
 resolve_worktree() {
-  local branch="$1"
+  local branch="$1" from="${2:-}"
   local repo; repo="$(_repo_name)"
 
   git check-ref-format --branch "$branch" &>/dev/null ||
@@ -145,6 +145,12 @@ resolve_worktree() {
   # Drop metadata for worktrees whose directories were deleted by hand. Must
   # happen before the lookup below, or a stale entry resolves to a dead path.
   git worktree prune 2>/dev/null || true
+
+  # --from only applies to new branches. Refuse rather than silently ignore it.
+  if [[ -n "$from" ]] && { git show-ref --verify --quiet "refs/heads/$branch" ||
+    git rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null; }; then
+    die "'$branch' already exists; --from only applies to new branches."
+  fi
 
   local existing
   if existing="$(_wt_of_branch "$branch")"; then
@@ -168,7 +174,8 @@ resolve_worktree() {
     git worktree add --track -b "$branch" "$WT_PATH" "origin/$branch" --quiet ||
       die "Failed to create worktree tracking 'origin/$branch'."
   else
-    local base; base="$(_default_branch)" ||
+    local base="$from"
+    [[ -n "$base" ]] || base="$(_default_branch)" ||
       die "Could not determine a base branch to fork '$branch' from."
     git worktree add -b "$branch" "$WT_PATH" "$base" --quiet ||
       die "Failed to create worktree for new branch '$branch' from '$base'."
@@ -259,10 +266,10 @@ launch_window() {
 # ─── Subcommands ──────────────────────────────────────────────────────────────
 
 cmd_open() {
-  local branch="$1"
+  local branch="$1" from="${2:-}"
   check_tmux
   check_repo
-  resolve_worktree "$branch"
+  resolve_worktree "$branch" "$from"
   launch_window
 }
 
@@ -371,6 +378,7 @@ ${BOLD}${SCRIPT_NAME}${RESET} — centralized git worktrees with tmux
 ${BOLD}Usage:${RESET}
   $SCRIPT_NAME                          List this repo's worktrees
   $SCRIPT_NAME <branch>                 Create (if needed) and open a worktree
+  $SCRIPT_NAME <branch> --from <ref>    Same, forking the new branch from <ref>
   $SCRIPT_NAME list                     List this repo's worktrees
   $SCRIPT_NAME rm <branch> [--force]    Remove worktree, branch, and window
   $SCRIPT_NAME path <branch>            Print a worktree's path
@@ -403,6 +411,7 @@ ${BOLD}Examples:${RESET}
   $SCRIPT_NAME feature-auth        ${DIM}# create worktree + branch + window${RESET}
   $SCRIPT_NAME feature-auth        ${DIM}# re-run switches to the window${RESET}
   $SCRIPT_NAME fix/schema          ${DIM}# → \$GROVE_HOME/worktrees/zio-blocks/fix-schema${RESET}
+  $SCRIPT_NAME fix/x --from v1.2   ${DIM}# new branch forked from tag v1.2${RESET}
   $SCRIPT_NAME main                ${DIM}# opens ~/projects/zio-blocks itself${RESET}
   $SCRIPT_NAME rm feature-auth     ${DIM}# removes worktree, branch, and window${RESET}
   cd "\$($SCRIPT_NAME path fix/schema)"
@@ -422,7 +431,13 @@ main() {
   rm) shift; cmd_rm "$@" ;;
   path) shift; cmd_path "$@" ;;
   -*) die "Unknown option: $1\n  Run ${CYAN}$SCRIPT_NAME --help${RESET} for usage." ;;
-  *) [[ $# -gt 1 ]] && die "Too many arguments."; cmd_open "$1" ;;
+  *)
+    if [[ "${2:-}" == --from ]]; then
+      [[ $# -eq 3 && -n "$3" ]] || die "Usage: $SCRIPT_NAME <branch> [--from <ref>]"
+      cmd_open "$1" "$3"
+    else
+      [[ $# -gt 1 ]] && die "Too many arguments."; cmd_open "$1"
+    fi ;;
   esac
 }
 

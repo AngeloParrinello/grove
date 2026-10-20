@@ -139,7 +139,7 @@ cmd_test() {
   # ── Section: WT — worktree creation ──────────────────────────────────────
 
   if ! $has_tmux; then
-    for _t in WT1 WT2 WT3 WT4 WT5 LS1 RM1 RM2 RM3 TX1 TX2; do
+    for _t in WT1 WT2 WT3 WT4 WT5 WT6 LS1 RM1 RM2 RM3 TX1 TX2; do
       _t_skip "$_t (tmux not in PATH)"
     done
   fi
@@ -197,6 +197,22 @@ cmd_test() {
   _t_eq "WT5: exits 0" "0" "$(_grc "$r2" spare)"
   _t_eq "WT5: worktree points at the existing branch" "$ghome/worktrees/gamma/spare" \
     "$( cd "$r2" && _wt_of_branch spare )"
+
+  _section "WT6 — --from forks a new branch from the given ref"
+
+  local r6; r6="$(_mkrepo theta)"
+  git -C "$r6" branch side main
+  git -C "$r6" branch spare main
+  git -C "$r6" worktree add -q "$tmp/side-wt" side
+  git -C "$tmp/side-wt" commit -q --allow-empty -m side
+  git -C "$r6" worktree remove "$tmp/side-wt"
+  _t_eq "WT6: exits 0" "0" "$(_grc "$r6" topic --from side)"
+  _t_eq "WT6: branch starts at the --from ref" "$(git -C "$r6" rev-parse side)" \
+    "$(git -C "$r6" rev-parse topic)"
+  _t_check "WT6: --from on an existing branch is refused" \
+    test "$(_grc "$r6" spare --from side)" -ne 0
+  _t_check "WT6: --from without a ref is refused" \
+    test "$(_grc "$r6" other --from)" -ne 0
 
   # ── Section: LS — list ───────────────────────────────────────────────────
 
